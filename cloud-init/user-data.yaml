@@ -28,7 +28,9 @@ write_files:
     content: |
       #!/usr/bin/env bash
       # Runs once as __USER__ at first boot; log in ~/hut-setup.log.
-      set -uxo pipefail
+      # Any failure leaves ~/.hut-failed instead of ~/.hut-ready; `hut wait` reports it.
+      set -euxo pipefail
+      trap 'touch "$HOME/.hut-failed"' ERR
       cd "$HOME"
       # Toolchains
       curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -46,6 +48,9 @@ write_files:
       eval "$(fnm env 2>/dev/null)"
       RC
       mkdir -p jobs
+      # Verify before declaring ready
+      for t in uv node claude codex gh tmux; do command -v "$t" || PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH" command -v "$t"; done
+      test -L .claude/settings.json
       touch .hut-ready
 runcmd:
   - systemctl restart ssh

@@ -2,7 +2,11 @@
 # hut — a lil Hetzner box of my own. `hut help` for commands.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do  # portable readlink -f (BSD readlink lacks -f on older macOS)
+  link=$(readlink "$self"); case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$self")" && pwd)"
 # shellcheck source=hut.conf
 source "$HERE/hut.conf"
 [ -f "$HERE/hut.local.conf" ] && source "$HERE/hut.local.conf"
@@ -14,15 +18,15 @@ need() { command -v "$1" >/dev/null || die "missing $1 — $2"; }
 
 hc() { need hcloud "brew install hcloud"; hcloud "$@"; }
 
-with_secrets() {  # re-exec under secretspec so HCLOUD_TOKEN (and TS_AUTHKEY) are in env
-  [ -n "${HCLOUD_TOKEN:-}" ] && return
+with_secrets() {  # re-exec once under secretspec so HCLOUD_TOKEN and TS_AUTHKEY are in env
+  [ -n "${HUT_SECRETS:-}" ] && return
   need secretspec "cargo install secretspec"
-  cd "$HERE" && exec secretspec run -- "$HERE/hut" "$@"
+  cd "$HERE" && HUT_SECRETS=1 exec secretspec run -- "$HERE/hut" "$@"
 }
 
 server_ip() {  # cached in .hut-ip after `up` so ssh/run/push don't need the API token
   if [ -f "$HERE/.hut-ip" ]; then cat "$HERE/.hut-ip"; return; fi
-  [ -n "${HCLOUD_TOKEN:-}" ] || with_secrets "$cmd" "${ARGS[@]}"
+  with_secrets "$cmd" "${ARGS[@]}"
   hc server ip "$HUT_NAME" 2>/dev/null | tee "$HERE/.hut-ip" || true
 }
 
@@ -58,8 +62,12 @@ cmd_wait() {
   local ip; ip=$(server_ip); [ -n "$ip" ] || die "no server"
   printf 'hut: waiting for %s' "$ip"
   for _ in $(seq 1 90); do
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$HUT_USER@$ip" test -f .hut-ready 2>/dev/null; then
-      echo; echo "hut: ready"; return; fi
+    local st; st=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$HUT_USER@$ip" \
+      'test -f .hut-ready && echo ready || { test -f .hut-failed && echo failed; }' 2>/dev/null || true)
+    case "$st" in
+      ready)  echo; echo "hut: ready"; return ;;
+      failed) echo; die "setup failed on the box — hut ssh cat hut-setup.log" ;;
+    esac
     printf .; sleep 10
   done
   echo; die "timed out; check: hut ssh cat hut-setup.log"
@@ -84,12 +92,12 @@ cmd_types() { hc server-type list -o columns=name,cores,memory,disk,architecture
 cmd_ssh()  { ssh -t -o StrictHostKeyChecking=accept-new "$(target)" "$@"; }
 cmd_mosh() { need mosh "brew install mosh"; mosh "$(target)" -- tmux new -A -s main; }
 
-cmd_run() {  # hut run <job-name> <command...> — detached tmux job, log in ~/jobs/<name>.log
-  [ $# -ge 2 ] || die "usage: hut run <job-name> <command...>"
+cmd_run() {  # hut run <job-name> "<shell command>" — detached tmux job, log in ~/jobs/<name>.log
+  [ $# -eq 2 ] || die 'usage: hut run <job-name> "<shell command>"  (one quoted string)'
   local name=$1; shift
   [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "job name: letters, digits, - and _ only"
   local remote="mkdir -p jobs && cat > jobs/$name.sh && tmux new -d -s job-$name 'bash -lc \"bash jobs/$name.sh > jobs/$name.log 2>&1; echo EXIT:\\\$? >> jobs/$name.log\"'"
-  printf '%s\n' "$*" | ssh -o StrictHostKeyChecking=accept-new "$(target)" "$remote"
+  printf '%s\n' "$1" | ssh -o StrictHostKeyChecking=accept-new "$(target)" "$remote"
   echo "hut: started job $name — hut log $name | hut jobs"
 }
 
@@ -132,7 +140,7 @@ hut — a lil Hetzner box of my own
   up | wait | down | status | types      provision / wait for cloud-init / delete / list
   ssh [cmd]        interactive shell, or run one command
   mosh             roaming shell attached to tmux "main"
-  run <name> <cmd> start a detached job (tmux), output in ~/jobs/<name>.log
+  run <name> "<cmd>" start a detached job (tmux), output in ~/jobs/<name>.log
   jobs | log <name> [-f] | attach <name> | kill <name>
   push <dir> [remote] / pull <remote> [dir]   rsync (push honours .gitignore)
   clone <owner/repo> [dir]                     gh clone on the box

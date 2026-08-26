@@ -26,3 +26,10 @@ the reference): Hetzner + Tailscale + tmux + Claude's browser login over SSH.
 **Checks run.** `bash -n hut`; `hut help`; `hut target` with a fake `.hut-ip`; cloud-init
 YAML parsed with PyYAML; the `hut run` remote string printed and inspected for quoting.
 Not yet run against a real server — needs `HCLOUD_TOKEN` (see README).
+
+**Codex red-team** (`codex-companion adversarial-review`, 2026-08-26) found four real issues,
+all fixed: `readlink -f` is not portable to older macOS (now a symlink-resolving loop);
+cloud-init touched `.hut-ready` even after failed installs (now `set -e`, verifies each tool,
+writes `.hut-failed` on error and `hut wait` reports it); `hut run` joined argv with spaces
+(now exactly one quoted command string); `with_secrets` used `HCLOUD_TOKEN` as a proxy for
+"secrets loaded", skipping `TS_AUTHKEY` (now a `HUT_SECRETS` sentinel).
