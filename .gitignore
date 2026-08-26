@@ -1,5 +1,5 @@
-hut.local.conf
+devbox.local.conf
 .env
 .env.local
 *.log
-.hut-ip
+.devbox-ip

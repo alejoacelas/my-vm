@@ -1,5 +1,5 @@
 #cloud-config
-# Rendered by ./hut up: __USER__, __SSH_KEY__, __DOTFILES__, __TS_AUTHKEY__ are substituted.
+# Rendered by ./devbox up: __USER__, __SSH_KEY__, __DOTFILES__, __TS_AUTHKEY__ are substituted.
 hostname: __NAME__
 users:
   - name: __USER__
@@ -12,7 +12,7 @@ package_update: true
 package_upgrade: true
 packages: [tmux, mosh, git, gh, ripgrep, jq, fd-find, build-essential, unzip, python3, python3-pip, ufw, fail2ban, curl, ca-certificates]
 write_files:
-  - path: /etc/ssh/sshd_config.d/hut.conf
+  - path: /etc/ssh/sshd_config.d/devbox.conf
     content: |
       PasswordAuthentication no
       PermitRootLogin no
@@ -22,15 +22,15 @@ write_files:
       set -g mouse on
       set -g history-limit 100000
       set -g default-terminal "tmux-256color"
-  - path: /home/__USER__/hut-setup.sh
+  - path: /home/__USER__/devbox-setup.sh
     owner: __USER__:__USER__
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
-      # Runs once as __USER__ at first boot; log in ~/hut-setup.log.
-      # Any failure leaves ~/.hut-failed instead of ~/.hut-ready; `hut wait` reports it.
+      # Runs once as __USER__ at first boot; log in ~/devbox-setup.log.
+      # Any failure leaves ~/.devbox-failed instead of ~/.devbox-ready; `devbox wait` reports it.
       set -euxo pipefail
-      trap 'touch "$HOME/.hut-failed"' ERR
+      trap 'touch "$HOME/.devbox-failed"' ERR
       cd "$HOME"
       # Toolchains
       curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -51,7 +51,7 @@ write_files:
       # Verify before declaring ready
       for t in uv node claude codex gh tmux; do command -v "$t" || PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH" command -v "$t"; done
       test -L .claude/settings.json
-      touch .hut-ready
+      touch .devbox-ready
 runcmd:
   - systemctl restart ssh
   - ufw allow OpenSSH
@@ -59,4 +59,4 @@ runcmd:
   - ufw --force enable
   - curl -fsSL https://tailscale.com/install.sh | sh
   - [ sh, -c, 'if [ -n "__TS_AUTHKEY__" ]; then tailscale up --ssh --authkey "__TS_AUTHKEY__" --hostname __NAME__; fi' ]
-  - sudo -iu __USER__ bash -c '~/hut-setup.sh > ~/hut-setup.log 2>&1'
+  - sudo -iu __USER__ bash -c '~/devbox-setup.sh > ~/devbox-setup.log 2>&1'

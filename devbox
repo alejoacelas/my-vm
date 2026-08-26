@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# devbox — my Hetzner dev box. `devbox help` for commands.
+set -euo pipefail
+
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do  # portable readlink -f (BSD readlink lacks -f on older macOS)
+  link=$(readlink "$self"); case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+HERE="$(cd "$(dirname "$self")" && pwd)"
+# shellcheck source=devbox.conf
+source "$HERE/devbox.conf"
+[ -f "$HERE/devbox.local.conf" ] && source "$HERE/devbox.local.conf"
+
+die() { printf 'devbox: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "missing $1 — $2"; }
+
+# --- Hetzner -----------------------------------------------------------------
+
+hc() { need hcloud "brew install hcloud"; hcloud "$@"; }
+
+with_secrets() {  # re-exec once under secretspec so HCLOUD_TOKEN and TS_AUTHKEY are in env
+  [ -n "${DEVBOX_SECRETS:-}" ] && return
+  need secretspec "cargo install secretspec"
+  cd "$HERE" && DEVBOX_SECRETS=1 exec secretspec run -- "$HERE/devbox" "$@"
+}
+
+server_ip() {  # cached in .devbox-ip after `up` so ssh/run/push don't need the API token
+  if [ -f "$HERE/.devbox-ip" ]; then cat "$HERE/.devbox-ip"; return; fi
+  with_secrets "$cmd" "${ARGS[@]}"
+  hc server ip "$DEVBOX_NAME" 2>/dev/null | tee "$HERE/.devbox-ip" || true
+}
+
+host() {  # prefer Tailscale MagicDNS name, fall back to public IP
+  if command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | grep -q "\"HostName\": \"$DEVBOX_NAME\""; then
+    echo "$DEVBOX_NAME"
+  else
+    local ip; ip=$(server_ip); [ -n "$ip" ] || die "no server named $DEVBOX_NAME — run: devbox up"
+    echo "$ip"
+  fi
+}
+
+target() { echo "$DEVBOX_USER@$(host)"; }
+
+render_user_data() {
+  local key; key=$(cat "$DEVBOX_SSH_KEY") || die "no SSH public key at $DEVBOX_SSH_KEY (ssh-keygen -t ed25519)"
+  sed -e "s|__NAME__|$DEVBOX_NAME|g" -e "s|__USER__|$DEVBOX_USER|g" -e "s|__SSH_KEY__|$key|g" \
+      -e "s|__DOTFILES__|$DEVBOX_DOTFILES|g" -e "s|__TS_AUTHKEY__|${TS_AUTHKEY:-}|g" \
+      "$HERE/cloud-init/user-data.yaml"
+}
+
+cmd_up() {
+  if [ -n "$(server_ip)" ]; then echo "devbox: $DEVBOX_NAME already exists at $(server_ip)"; return; fi
+  local ud; ud=$(mktemp); render_user_data > "$ud"
+  hc ssh-key describe devbox-mac >/dev/null 2>&1 || hc ssh-key create --name devbox-mac --public-key-from-file "$DEVBOX_SSH_KEY" >/dev/null
+  hc server create --name "$DEVBOX_NAME" --type "$DEVBOX_TYPE" --location "$DEVBOX_LOCATION" --image "$DEVBOX_IMAGE" \
+    --ssh-key devbox-mac --user-data-from-file "$ud" --label devbox=1
+  rm -f "$ud"; rm -f "$HERE/.devbox-ip"; server_ip >/dev/null
+  echo 'devbox: created. cloud-init takes ~5 min; devbox wait blocks until tools are installed.'
+}
+
+cmd_wait() {
+  local ip; ip=$(server_ip); [ -n "$ip" ] || die "no server"
+  printf 'devbox: waiting for %s' "$ip"
+  for _ in $(seq 1 90); do
+    local st; st=$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$DEVBOX_USER@$ip" \
+      'test -f .devbox-ready && echo ready || { test -f .devbox-failed && echo failed; }' 2>/dev/null || true)
+    case "$st" in
+      ready)  echo; echo "devbox: ready"; return ;;
+      failed) echo; die "setup failed on the box — devbox ssh cat devbox-setup.log" ;;
+    esac
+    printf .; sleep 10
+  done
+  echo; die "timed out; check: devbox ssh cat devbox-setup.log"
+}
+
+cmd_down() {
+  [ -n "$(server_ip)" ] || die "no server to delete"
+  read -rp "Delete server $DEVBOX_NAME and everything on it? Type its name to confirm: " ans
+  [ "$ans" = "$DEVBOX_NAME" ] || die "aborted"
+  hc server delete "$DEVBOX_NAME"; rm -f "$HERE/.devbox-ip"
+}
+
+cmd_status() {
+  hc server list -l devbox=1 -o columns=name,status,type,ipv4,datacenter,age
+  command -v tailscale >/dev/null && tailscale status 2>/dev/null | grep -F " $DEVBOX_NAME " || true
+}
+
+cmd_types() { hc server-type list -o columns=name,cores,memory,disk,architecture; echo; echo "Prices: https://www.hetzner.com/cloud#pricing"; }
+
+# --- Access -------------------------------------------------------------------
+
+cmd_ssh()  { ssh -t -o StrictHostKeyChecking=accept-new "$(target)" "$@"; }
+cmd_mosh() { need mosh "brew install mosh"; mosh "$(target)" -- tmux new -A -s main; }
+
+cmd_run() {  # devbox run <job-name> "<shell command>" — detached tmux job, log in ~/jobs/<name>.log
+  [ $# -eq 2 ] || die 'usage: devbox run <job-name> "<shell command>"  (one quoted string)'
+  local name=$1; shift
+  [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "job name: letters, digits, - and _ only"
+  local remote="mkdir -p jobs && cat > jobs/$name.sh && tmux new -d -s job-$name 'bash -lc \"bash jobs/$name.sh > jobs/$name.log 2>&1; echo EXIT:\\\$? >> jobs/$name.log\"'"
+  printf '%s\n' "$1" | ssh -o StrictHostKeyChecking=accept-new "$(target)" "$remote"
+  echo "devbox: started job $name — devbox log $name | devbox jobs"
+}
+
+cmd_jobs() { ssh "$(target)" 'bash -lc "tmux ls 2>/dev/null | sed s/^job-// ; echo; ls -lt jobs 2>/dev/null | head"'; }
+cmd_log()  { [ $# -ge 1 ] || die "usage: devbox log <job-name> [-f]"; ssh "$(target)" "tail -n 200 ${2:-} jobs/$1.log"; }
+cmd_attach() { [ $# -ge 1 ] || die "usage: devbox attach <job-name>"; ssh -t "$(target)" "tmux attach -t job-$1"; }
+cmd_kill() { [ $# -ge 1 ] || die "usage: devbox kill <job-name>"; ssh "$(target)" "tmux kill-session -t job-$1"; }
+
+# --- Files --------------------------------------------------------------------
+
+cmd_push() {  # devbox push <local-dir> [remote-dir]  (gitignore-aware)
+  [ $# -ge 1 ] || die "usage: devbox push <local-dir> [remote-dir]"
+  local src=${1%/}; local dst=${2:-$(basename "$src")}
+  rsync -az --info=stats1 --filter=':- .gitignore' --exclude .git "$src/" "$(target):$dst/"
+}
+cmd_pull() {  # devbox pull <remote-path> [local-dir]
+  [ $# -ge 1 ] || die "usage: devbox pull <remote-path> [local-dir]"
+  rsync -az --info=stats1 "$(target):${1%/}/" "${2:-$(basename "$1")}/"
+}
+cmd_clone() { [ $# -ge 1 ] || die "usage: devbox clone <owner/repo> [dir]"; ssh "$(target)" "bash -lc 'gh repo clone $1 ${2:-}'"; }
+
+# --- Setup helpers -----------------------------------------------------------
+
+cmd_login() {
+  cat <<EOF
+Log the box's agents in (each prints a URL to open on this Mac, then a code to paste back):
+
+  devbox ssh claude            # Anthropic subscription login
+  devbox ssh codex login       # ChatGPT login
+  devbox ssh gh auth login     # GitHub, so \`devbox clone\` works
+EOF
+}
+
+cmd_target() { target; }
+
+cmd_help() {
+  cat <<'EOF'
+devbox — my Hetzner dev box
+
+  up | wait | down | status | types      provision / wait for cloud-init / delete / list
+  ssh [cmd]        interactive shell, or run one command
+  mosh             roaming shell attached to tmux "main"
+  run <name> "<cmd>" start a detached job (tmux), output in ~/jobs/<name>.log
+  jobs | log <name> [-f] | attach <name> | kill <name>
+  push <dir> [remote] / pull <remote> [dir]   rsync (push honours .gitignore)
+  clone <owner/repo> [dir]                     gh clone on the box
+  login            how to log Claude, Codex and gh in on the box
+  target           print user@host (Tailscale name if joined, else public IP)
+
+Secrets come from secretspec (1Password Developer-Credentials): HCLOUD_TOKEN, optional TS_AUTHKEY.
+Settings: devbox.conf; override in devbox.local.conf.
+EOF
+}
+
+cmd=${1:-help}; shift || true; ARGS=("$@")
+case "$cmd" in up|down|status|types) with_secrets "$cmd" "$@" ;; esac
+case "$cmd" in
+  up|wait|down|status|types|ssh|mosh|run|jobs|log|attach|kill|push|pull|clone|login|target|help) "cmd_$cmd" "$@" ;;
+  *) die "unknown command $cmd (devbox help)" ;;
+esac
