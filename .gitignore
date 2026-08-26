@@ -1,5 +1,5 @@
-devbox.local.conf
+my-vm.local.conf
 .env
 .env.local
 *.log
-.devbox-ip
+.my-vm-ip
