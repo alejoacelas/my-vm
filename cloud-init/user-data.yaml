@@ -1,0 +1,57 @@
+#cloud-config
+# Rendered by ./hut up: __USER__, __SSH_KEY__, __DOTFILES__, __TS_AUTHKEY__ are substituted.
+hostname: __NAME__
+users:
+  - name: __USER__
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - __SSH_KEY__
+package_update: true
+package_upgrade: true
+packages: [tmux, mosh, git, gh, ripgrep, jq, fd-find, build-essential, unzip, python3, python3-pip, ufw, fail2ban, curl, ca-certificates]
+write_files:
+  - path: /etc/ssh/sshd_config.d/hut.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+  - path: /home/__USER__/.tmux.conf
+    owner: __USER__:__USER__
+    content: |
+      set -g mouse on
+      set -g history-limit 100000
+      set -g default-terminal "tmux-256color"
+  - path: /home/__USER__/hut-setup.sh
+    owner: __USER__:__USER__
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      # Runs once as __USER__ at first boot; log in ~/hut-setup.log.
+      set -uxo pipefail
+      cd "$HOME"
+      # Toolchains
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell
+      export PATH="$HOME/.local/share/fnm:$HOME/.local/bin:$PATH"
+      eval "$(fnm env)"; fnm install --lts; fnm default lts-latest
+      # Agents
+      curl -fsSL https://claude.ai/install.sh | bash
+      curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
+      # Dotfiles (public repo) -> ~/.claude etc.
+      mkdir -p best/ai && git clone --depth 1 __DOTFILES__ best/ai/dotfiles && bash best/ai/dotfiles/bin/install.sh
+      # Shell
+      cat >> .bashrc <<'RC'
+      export PATH="$HOME/.local/share/fnm:$HOME/.local/bin:$HOME/.claude/local:$PATH"
+      eval "$(fnm env 2>/dev/null)"
+      RC
+      mkdir -p jobs
+      touch .hut-ready
+runcmd:
+  - systemctl restart ssh
+  - ufw allow OpenSSH
+  - ufw allow 60000:61000/udp   # mosh
+  - ufw --force enable
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  - [ sh, -c, 'if [ -n "__TS_AUTHKEY__" ]; then tailscale up --ssh --authkey "__TS_AUTHKEY__" --hostname __NAME__; fi' ]
+  - sudo -iu __USER__ bash -c '~/hut-setup.sh > ~/hut-setup.log 2>&1'

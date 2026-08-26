@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# hut — a lil Hetzner box of my own. `hut help` for commands.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hut.conf
+source "$HERE/hut.conf"
+[ -f "$HERE/hut.local.conf" ] && source "$HERE/hut.local.conf"
+
+die() { printf 'hut: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "missing $1 — $2"; }
+
+# --- Hetzner -----------------------------------------------------------------
+
+hc() { need hcloud "brew install hcloud"; hcloud "$@"; }
+
+with_secrets() {  # re-exec under secretspec so HCLOUD_TOKEN (and TS_AUTHKEY) are in env
+  [ -n "${HCLOUD_TOKEN:-}" ] && return
+  need secretspec "cargo install secretspec"
+  cd "$HERE" && exec secretspec run -- "$HERE/hut" "$@"
+}
+
+server_ip() {  # cached in .hut-ip after `up` so ssh/run/push don't need the API token
+  if [ -f "$HERE/.hut-ip" ]; then cat "$HERE/.hut-ip"; return; fi
+  [ -n "${HCLOUD_TOKEN:-}" ] || with_secrets "$cmd" "${ARGS[@]}"
+  hc server ip "$HUT_NAME" 2>/dev/null | tee "$HERE/.hut-ip" || true
+}
+
+host() {  # prefer Tailscale MagicDNS name, fall back to public IP
+  if command -v tailscale >/dev/null && tailscale status --json 2>/dev/null | grep -q "\"HostName\": \"$HUT_NAME\""; then
+    echo "$HUT_NAME"
+  else
+    local ip; ip=$(server_ip); [ -n "$ip" ] || die "no server named $HUT_NAME — run: hut up"
+    echo "$ip"
+  fi
+}
+
+target() { echo "$HUT_USER@$(host)"; }
+
+render_user_data() {
+  local key; key=$(cat "$HUT_SSH_KEY") || die "no SSH public key at $HUT_SSH_KEY (ssh-keygen -t ed25519)"
+  sed -e "s|__NAME__|$HUT_NAME|g" -e "s|__USER__|$HUT_USER|g" -e "s|__SSH_KEY__|$key|g" \
+      -e "s|__DOTFILES__|$HUT_DOTFILES|g" -e "s|__TS_AUTHKEY__|${TS_AUTHKEY:-}|g" \
+      "$HERE/cloud-init/user-data.yaml"
+}
+
+cmd_up() {
+  if [ -n "$(server_ip)" ]; then echo "hut: $HUT_NAME already exists at $(server_ip)"; return; fi
+  local ud; ud=$(mktemp); render_user_data > "$ud"
+  hc ssh-key describe hut-mac >/dev/null 2>&1 || hc ssh-key create --name hut-mac --public-key-from-file "$HUT_SSH_KEY" >/dev/null
+  hc server create --name "$HUT_NAME" --type "$HUT_TYPE" --location "$HUT_LOCATION" --image "$HUT_IMAGE" \
+    --ssh-key hut-mac --user-data-from-file "$ud" --label hut=1
+  rm -f "$ud"; rm -f "$HERE/.hut-ip"; server_ip >/dev/null
+  echo 'hut: created. cloud-init takes ~5 min; hut wait blocks until tools are installed.'
+}
+
+cmd_wait() {
+  local ip; ip=$(server_ip); [ -n "$ip" ] || die "no server"
+  printf 'hut: waiting for %s' "$ip"
+  for _ in $(seq 1 90); do
+    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$HUT_USER@$ip" test -f .hut-ready 2>/dev/null; then
+      echo; echo "hut: ready"; return; fi
+    printf .; sleep 10
+  done
+  echo; die "timed out; check: hut ssh cat hut-setup.log"
+}
+
+cmd_down() {
+  [ -n "$(server_ip)" ] || die "no server to delete"
+  read -rp "Delete server $HUT_NAME and everything on it? Type its name to confirm: " ans
+  [ "$ans" = "$HUT_NAME" ] || die "aborted"
+  hc server delete "$HUT_NAME"; rm -f "$HERE/.hut-ip"
+}
+
+cmd_status() {
+  hc server list -l hut=1 -o columns=name,status,type,ipv4,datacenter,age
+  command -v tailscale >/dev/null && tailscale status 2>/dev/null | grep -F " $HUT_NAME " || true
+}
+
+cmd_types() { hc server-type list -o columns=name,cores,memory,disk,architecture; echo; echo "Prices: https://www.hetzner.com/cloud#pricing"; }
+
+# --- Access -------------------------------------------------------------------
+
+cmd_ssh()  { ssh -t -o StrictHostKeyChecking=accept-new "$(target)" "$@"; }
+cmd_mosh() { need mosh "brew install mosh"; mosh "$(target)" -- tmux new -A -s main; }
+
+cmd_run() {  # hut run <job-name> <command...> — detached tmux job, log in ~/jobs/<name>.log
+  [ $# -ge 2 ] || die "usage: hut run <job-name> <command...>"
+  local name=$1; shift
+  [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "job name: letters, digits, - and _ only"
+  local remote="mkdir -p jobs && cat > jobs/$name.sh && tmux new -d -s job-$name 'bash -lc \"bash jobs/$name.sh > jobs/$name.log 2>&1; echo EXIT:\\\$? >> jobs/$name.log\"'"
+  printf '%s\n' "$*" | ssh -o StrictHostKeyChecking=accept-new "$(target)" "$remote"
+  echo "hut: started job $name — hut log $name | hut jobs"
+}
+
+cmd_jobs() { ssh "$(target)" 'bash -lc "tmux ls 2>/dev/null | sed s/^job-// ; echo; ls -lt jobs 2>/dev/null | head"'; }
+cmd_log()  { [ $# -ge 1 ] || die "usage: hut log <job-name> [-f]"; ssh "$(target)" "tail -n 200 ${2:-} jobs/$1.log"; }
+cmd_attach() { [ $# -ge 1 ] || die "usage: hut attach <job-name>"; ssh -t "$(target)" "tmux attach -t job-$1"; }
+cmd_kill() { [ $# -ge 1 ] || die "usage: hut kill <job-name>"; ssh "$(target)" "tmux kill-session -t job-$1"; }
+
+# --- Files --------------------------------------------------------------------
+
+cmd_push() {  # hut push <local-dir> [remote-dir]  (gitignore-aware)
+  [ $# -ge 1 ] || die "usage: hut push <local-dir> [remote-dir]"
+  local src=${1%/}; local dst=${2:-$(basename "$src")}
+  rsync -az --info=stats1 --filter=':- .gitignore' --exclude .git "$src/" "$(target):$dst/"
+}
+cmd_pull() {  # hut pull <remote-path> [local-dir]
+  [ $# -ge 1 ] || die "usage: hut pull <remote-path> [local-dir]"
+  rsync -az --info=stats1 "$(target):${1%/}/" "${2:-$(basename "$1")}/"
+}
+cmd_clone() { [ $# -ge 1 ] || die "usage: hut clone <owner/repo> [dir]"; ssh "$(target)" "bash -lc 'gh repo clone $1 ${2:-}'"; }
+
+# --- Setup helpers -----------------------------------------------------------
+
+cmd_login() {
+  cat <<EOF
+Log the box's agents in (each prints a URL to open on this Mac, then a code to paste back):
+
+  hut ssh claude            # Anthropic subscription login
+  hut ssh codex login       # ChatGPT login
+  hut ssh gh auth login     # GitHub, so \`hut clone\` works
+EOF
+}
+
+cmd_target() { target; }
+
+cmd_help() {
+  cat <<'EOF'
+hut — a lil Hetzner box of my own
+
+  up | wait | down | status | types      provision / wait for cloud-init / delete / list
+  ssh [cmd]        interactive shell, or run one command
+  mosh             roaming shell attached to tmux "main"
+  run <name> <cmd> start a detached job (tmux), output in ~/jobs/<name>.log
+  jobs | log <name> [-f] | attach <name> | kill <name>
+  push <dir> [remote] / pull <remote> [dir]   rsync (push honours .gitignore)
+  clone <owner/repo> [dir]                     gh clone on the box
+  login            how to log Claude, Codex and gh in on the box
+  target           print user@host (Tailscale name if joined, else public IP)
+
+Secrets come from secretspec (1Password Developer-Credentials): HCLOUD_TOKEN, optional TS_AUTHKEY.
+Settings: hut.conf; override in hut.local.conf.
+EOF
+}
+
+cmd=${1:-help}; shift || true; ARGS=("$@")
+case "$cmd" in up|down|status|types) with_secrets "$cmd" "$@" ;; esac
+case "$cmd" in
+  up|wait|down|status|types|ssh|mosh|run|jobs|log|attach|kill|push|pull|clone|login|target|help) "cmd_$cmd" "$@" ;;
+  *) die "unknown command $cmd (hut help)" ;;
+esac
