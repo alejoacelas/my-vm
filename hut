@@ -2,7 +2,7 @@
 # hut — a lil Hetzner box of my own. `hut help` for commands.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=hut.conf
 source "$HERE/hut.conf"
 [ -f "$HERE/hut.local.conf" ] && source "$HERE/hut.local.conf"
