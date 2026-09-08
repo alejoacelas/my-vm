@@ -41,7 +41,7 @@ write_files:
       curl -fsSL https://claude.ai/install.sh | bash
       curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
       # Dotfiles (public repo) -> ~/.claude etc.
-      mkdir -p best/ai && git clone --depth 1 __DOTFILES__ best/ai/dotfiles && bash best/ai/dotfiles/bin/install.sh
+      mkdir -p best && git clone --depth 1 __DOTFILES__ best/dotfiles && bash best/dotfiles/bin/install.sh
       # Shell
       cat >> .bashrc <<'RC'
       export PATH="$HOME/.local/share/fnm:$HOME/.local/bin:$HOME/.claude/local:$PATH"
